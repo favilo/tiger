@@ -13,7 +13,7 @@ pub struct ParseError;
 #[derive(Default, Debug)]
 pub struct Program {}
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Op {
     Plus,
     Minus,
@@ -21,7 +21,7 @@ enum Op {
     Divide,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Expression {
     Id(String),
     Nil,
@@ -101,7 +101,8 @@ fn call_exp(input: &str) -> nom::IResult<&str, Expression> {
 }
 
 fn exp_list_comma(input: &str) -> nom::IResult<&str, Vec<Expression>> {
-    let (input, (mut head, mut last)) = tuple((many0(terminated(exp, tag(","))), exp_as_list))(input)?;
+    let (input, (mut head, mut last)) =
+        tuple((many0(terminated(exp, tag(","))), exp_as_list))(input)?;
     head.append(&mut last);
     Ok((input, head))
 }
@@ -142,4 +143,30 @@ where
     H: Fn(I) -> nom::IResult<I, O3, E>,
 {
     terminated(preceded(open, mid), close)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hello_world() {
+        let input = " /* Comment */\n\
+                     print(\"Hello, World!\\n\", \"Testing\", 1, 2, nil)\n";
+        let (input, p) = program(&input).unwrap();
+        assert_eq!(input, "");
+        assert_eq!(
+            p,
+            Expression::Call {
+                name: "print".to_string(),
+                parameters: vec![
+                    Expression::StringLit("Hello, World!\\n".to_string()),
+                    Expression::StringLit("Testing".to_string()),
+                    Expression::IntLit(1),
+                    Expression::IntLit(2),
+                    Expression::Nil
+                ]
+            }
+        );
+    }
 }
