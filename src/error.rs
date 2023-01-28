@@ -89,6 +89,10 @@ impl<'input> From<NomParseError<'input>> for Error<'input> {
 #[derive(Error, Debug, Diagnostic)]
 pub enum InterpretterError {
     #[error("Type Error: {0}")]
-    #[diagnostic(code(interpret::types))]
+    #[diagnostic(code(interpret::r#type))]
     TypeError(String),
+
+    #[error("Name Error: {0} doesn't exist")]
+    #[diagnostic(code(interpret::name))]
+    NameError(String),
 }

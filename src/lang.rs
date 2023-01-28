@@ -1,17 +1,25 @@
 use std::{collections::BTreeMap, convert::TryFrom};
 
+use miette::GraphicalReportHandler;
+
+#[allow(unused_imports)]
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_until},
-    character::complete::{line_ending, multispace0},
-    combinator::{all_consuming, map, opt},
-    multi::{fold_many0, many1},
+    bytes::complete::{tag, take_until, take_while},
+    character::{
+        complete::{alpha1, multispace0, multispace1},
+        is_alphanumeric,
+    },
+    combinator::{all_consuming, fail, map, not, opt, recognize},
+    multi::{fold_many0, many0, many1},
     sequence::{delimited, tuple},
     Finish, IResult, Parser,
 };
+
 use nom_locate::LocatedSpan;
-use nom_recursive::{recursive_parser, RecursiveInfo};
+use nom_recursive::{recursive_parser, HasRecursiveInfo, RecursiveInfo};
 use nom_supreme::{error::ErrorTree, ParserExt};
+use nom_tracable::{tracable_parser, HasTracableInfo, TracableInfo};
 
 use crate::error::{Error, FormattedError, InterpretterError};
 
@@ -21,23 +29,49 @@ pub trait Parse<'input>: Sized {
 
     /// Helper method for tests to convert a str into a raw span and parse
     fn parse_from_raw(input: &'input str) -> ParseResult<'input, Self> {
-        let i = LocatedSpan::new_extra(input, RecursiveInfo::new());
+        let i = Span::new_extra(input, ParserInfo::default());
         Self::parse(i)
+    }
+}
+
+trait PrettyUnwrap<T>: Sized {
+    fn pretty_unwrap(self) -> T;
+}
+
+impl<T> PrettyUnwrap<T> for Result<T, FormattedError<'_>> {
+    fn pretty_unwrap(self) -> T {
+        match self {
+            Ok(p) => p,
+            Err(e) => {
+                let mut s = String::new();
+                GraphicalReportHandler::new()
+                    .render_report(&mut s, &e)
+                    .unwrap();
+                panic!("{}", s);
+            }
+        }
     }
 }
 
 #[derive(Default, Debug)]
 pub struct Program {
-    expressions: Vec<Expression>,
-    _variables: BTreeMap<String, Expression>,
+    /// The expressions that make up the program
+    // TODO: Make this A Source type instead of Vec<Expression>
+    expression: Expression,
+
+    /// Stack of variable definitions
+    variables: Vec<BTreeMap<String, Expression>>,
     // TODO: Decide how to define function definitions.
     // It'll probably be a new struct
-    // _functions: BTreeMap<String, Expression>,
+    // _functions: BTreeMap<String, FnDec>,
+
+    // TODO: Types need to happen too.
+    // _types: BTreeMap<String, TypeDec>
 }
 
 impl Program {
     pub fn new(input: &str) -> Result<Self, FormattedError> {
-        let i = LocatedSpan::new_extra(input, RecursiveInfo::new());
+        let i = Span::new_extra(input, ParserInfo::default());
         match all_consuming(Self::parse)(i).finish() {
             Ok((_, this)) => Ok(this),
             Err(e) => Err(FormattedError::from_nom(input, e)),
@@ -73,45 +107,114 @@ impl Program {
             }
             Expression::UnaryOp(Op::Minus, expr) => Expression::IntLit(-self.eval(expr)?.as_int()?),
             Expression::UnaryOp(_, _) => unreachable!("Unary isn't defined for any other op"),
-            Expression::Id(_name) => todo!(),
-            Expression::Assign(_name, _expr) => todo!(),
-            Expression::Call {
-                name: _,
-                parameters: _,
-            } => todo!(),
+            Expression::Id(name) => self
+                .variables
+                .last()
+                .ok_or(InterpretterError::NameError(name.to_string()))?
+                .get(name)
+                .ok_or(InterpretterError::NameError(name.to_string()))?
+                .clone(),
+            Expression::Assign(name, expr) => {
+                if !self
+                    .variables
+                    .last()
+                    .ok_or(InterpretterError::NameError(name.to_string()))?
+                    .contains_key(name)
+                {
+                    Err(InterpretterError::NameError(name.to_string()))?;
+                }
+                let value = self.eval(expr)?;
+                self.variables[0].insert(name.clone(), value);
+                Expression::Nil
+            }
             Expression::Block(exprs) => exprs
                 .iter()
                 .map(|expr| self.eval(expr))
                 .last()
                 .unwrap_or(Ok(Expression::Nil))?,
+            Expression::Let { decls, exprs } => {
+                // Push new stack
+                let mut vars = BTreeMap::default();
+                decls.into_iter().try_for_each(|d| {
+                    d.assign_value(self, &mut vars)?;
+                    Ok(())
+                })?;
+
+                self.variables.push(vars);
+                // evaluate exprs
+                let ret = self.eval(exprs)?;
+
+                // Pop stack
+                self.variables.pop();
+                ret
+            }
+            Expression::Call {
+                name: _,
+                parameters: _,
+            } => todo!(),
         })
     }
 
     pub fn run(&mut self) -> Result<Expression, InterpretterError> {
-        let mut result = Expression::IntLit(0);
-        let expressions = self.expressions.clone();
-        for expr in &expressions {
-            result = self.eval(expr)?;
-        }
+        let expr = self.expression.clone();
+        let result = self.eval(&expr)?;
         Ok(result)
     }
 }
 
 impl<'input> Parse<'input> for Program {
     fn parse(input: Span<'input>) -> ParseResult<'input, Self> {
-        let exprs = many1(Expression::parse.terminated(tuple((
-            multispace0,
-            opt(tag(";").delimited_by(multispace0)),
-            opt(line_ending),
-        ))));
-        map(exprs, |expressions| Self {
-            expressions,
+        let expr = Expression::parse;
+        map(expr, |expression| Self {
+            expression,
             ..Default::default()
         })(input)
     }
 }
 
-pub type Span<'input> = LocatedSpan<&'input str, RecursiveInfo>;
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub struct ParserInfo {
+    recursive: RecursiveInfo,
+    tracable: TracableInfo,
+}
+
+impl Default for ParserInfo {
+    fn default() -> Self {
+        Self {
+            tracable: TracableInfo::default()
+                .forward(true)
+                .backward(true)
+                .parser_width(64)
+                .fragment_width(20)
+                .color(true),
+            recursive: RecursiveInfo::default(),
+        }
+    }
+}
+
+impl HasRecursiveInfo for ParserInfo {
+    fn get_recursive_info(&self) -> RecursiveInfo {
+        self.recursive
+    }
+
+    fn set_recursive_info(mut self, info: RecursiveInfo) -> Self {
+        self.recursive = info;
+        self
+    }
+}
+
+impl HasTracableInfo for ParserInfo {
+    fn get_tracable_info(&self) -> TracableInfo {
+        self.tracable
+    }
+
+    fn set_tracable_info(mut self, info: TracableInfo) -> Self {
+        self.tracable = info;
+        self
+    }
+}
+
+pub type Span<'input> = LocatedSpan<&'input str, ParserInfo>;
 pub type NomParseError<'input> = ErrorTree<Span<'input>>;
 pub type ParseResult<'input, T> = IResult<Span<'input>, T, NomParseError<'input>>;
 
@@ -155,14 +258,116 @@ impl Op {
     }
 }
 
+pub type TypeId = String;
+
 #[derive(Debug, PartialEq, Clone)]
+pub enum Declaration {
+    // Type
+    // Class
+    Variable {
+        id: String,
+        type_id: Option<TypeId>,
+        expr: Expression,
+    },
+    // Function {
+    //     id: String,
+    //     dec: TyFields,
+    //     ret: TypeId ,
+    //     expr: Expression
+    // },
+    // Primitive {
+    //     id: String,
+    //     dec: TyFields,
+    //     ret: TypeId ,
+    // },
+    // Import(String),
+}
+
+impl Parse<'_> for Declaration {
+    #[tracable_parser]
+    fn parse(input: Span) -> ParseResult<Self> {
+        alt((Self::vardec.context("variable declaration"),))(input)
+    }
+}
+
+impl Declaration {
+    pub fn assign_value(
+        &self,
+        p: &mut Program,
+        vars: &mut BTreeMap<String, Expression>,
+    ) -> Result<(), InterpretterError> {
+        match self {
+            Declaration::Variable {
+                id,
+                type_id: _,
+                expr,
+            } => {
+                vars.insert(id.clone(), p.eval(expr)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[tracable_parser]
+    fn var_id(input: Span) -> ParseResult<String> {
+        id.preceded_by(tag("var").context("var keyword").delimited_by(multispace0))
+            .context("variable id")
+            .parse(input)
+    }
+
+    #[tracable_parser]
+    fn var_type(input: Span) -> ParseResult<Option<String>> {
+        opt(id
+            .preceded_by(tag(":").cut().context("colon").delimited_by(multispace0))
+            .context("variable type"))
+        .parse(input)
+    }
+
+    fn var_value(input: Span) -> ParseResult<Expression> {
+        Expression::expr
+            .context("variable value")
+            .preceded_by(
+                tag(":=")
+                    .context("assignment operator")
+                    .delimited_by(multispace0),
+            )
+            .parse(input)
+    }
+
+    #[tracable_parser]
+    fn vardec(input: Span) -> ParseResult<Self> {
+        let (input, var_id) = Self::var_id.parse(input)?;
+
+        let (input, type_id) = Self::var_type.parse(input)?;
+
+        let (input, expr) = Self::var_value.parse(input)?;
+
+        Ok((
+            input,
+            Declaration::Variable {
+                id: var_id,
+                type_id,
+                expr,
+            },
+        ))
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Clone)]
 pub enum Expression {
+    #[default]
     Nil,
     IntLit(i64),
     StringLit(String),
 
     Id(String),
     Assign(String, Box<Expression>),
+    Let {
+        decls: Vec<Declaration>,
+        exprs: Box<Expression>,
+    },
+
+    #[allow(dead_code)]
     Call {
         name: String,
         parameters: Vec<Expression>,
@@ -186,6 +391,7 @@ impl<'s> Parse<'s> for Expression {
     }
 }
 
+// TODO: Comments
 impl Expression {
     pub fn as_int(&self) -> Result<i64, InterpretterError> {
         match self {
@@ -196,6 +402,7 @@ impl Expression {
         }
     }
 
+    #[tracable_parser]
     fn int_lit(input: Span<'_>) -> ParseResult<'_, Self> {
         map(
             nom::character::complete::u64.delimited_by(multispace0),
@@ -205,16 +412,18 @@ impl Expression {
         .parse(input)
     }
 
+    #[tracable_parser]
     fn string_lit(input: Span<'_>) -> ParseResult<'_, Self> {
         // TODO: Deal with escaping
         map(
             delimited(tag("\""), take_until("\""), tag("\"")),
-            |s: LocatedSpan<&str, _>| Expression::StringLit(s.fragment().to_string()),
+            |s: Span| Expression::StringLit(s.fragment().to_string()),
         )
         .context("String Literal")
         .parse(input)
     }
 
+    #[tracable_parser]
     fn nil_lit(input: Span<'_>) -> ParseResult<'_, Self> {
         map(tag("nil"), |_| Expression::Nil)
             .delimited_by(multispace0)
@@ -222,28 +431,52 @@ impl Expression {
             .parse(input)
     }
 
+    #[tracable_parser]
     fn lit(input: Span<'_>) -> ParseResult<'_, Self> {
         alt((Self::int_lit, Self::string_lit, Self::nil_lit))
             .delimited_by(multispace0)
-            .context("Literal")
             .parse(input)
     }
 
+    #[tracable_parser]
+    fn lvalue(input: Span) -> ParseResult<Self> {
+        map(id, |name| Expression::Id(name)).parse(input)
+    }
+
+    #[tracable_parser]
+    fn assign(input: Span) -> ParseResult<Self> {
+        map(
+            tuple((
+                Self::lvalue.terminated(tag(":=").delimited_by(multispace0)),
+                Self::expr,
+            )),
+            |(name, expr)| {
+                let Expression::Id(name) = name else {panic!("Not sure how we got here")};
+                Expression::Assign(name, Box::new(expr))
+            },
+        )
+        .parse(input)
+    }
+
     #[recursive_parser]
+    #[tracable_parser]
     fn atom(s: Span<'_>) -> ParseResult<'_, Self> {
         alt((
-            Self::lit.context("literal"),
             delimited(
                 tag("(").delimited_by(multispace0),
-                Self::exprs,
+                Self::exprs.context("exprs"),
                 tag(")").delimited_by(multispace0),
             )
             .context("parentheses"),
+            Self::lit.context("literal"),
+            Self::assign.context("assignment"),
+            Self::lvalue.context("lvalue"),
         ))
         .context("atom")
         .parse(s)
     }
 
+    #[tracable_parser]
     fn unary(input: Span<'_>) -> ParseResult<'_, Self> {
         map(
             tuple((
@@ -266,8 +499,9 @@ impl Expression {
         )(input)
     }
 
+    #[tracable_parser]
     fn product(input: Span<'_>) -> ParseResult<'_, Self> {
-        let (input, lhs) = Self::unary.context("lhs operand").parse(input)?;
+        let (input, lhs) = Self::unary.context("product lhs operand").parse(input)?;
         let (input, rest) = fold_many0(
             tuple((
                 alt((tag("*"), tag("/")))
@@ -292,8 +526,9 @@ impl Expression {
         Ok((input, lhs))
     }
 
+    #[tracable_parser]
     fn sum(input: Span<'_>) -> ParseResult<'_, Self> {
-        let (input, lhs) = Self::product.context("lhs operand").parse(input)?;
+        let (input, lhs) = Self::product.context("sum lhs operand").parse(input)?;
         let (input, rest) = fold_many0(
             tuple((
                 alt((tag("+"), tag("-")))
@@ -318,8 +553,9 @@ impl Expression {
         Ok((input, lhs))
     }
 
+    #[tracable_parser]
     fn cmp(input: Span<'_>) -> ParseResult<'_, Self> {
-        let (input, lhs) = Self::sum.context("lhs operand").parse(input)?;
+        let (input, lhs) = Self::sum.context("cmp lhs operand").parse(input)?;
         let (input, rest) = fold_many0(
             tuple((
                 alt((
@@ -351,8 +587,9 @@ impl Expression {
         Ok((input, lhs))
     }
 
+    #[tracable_parser]
     fn and(input: Span<'_>) -> ParseResult<'_, Self> {
-        let (input, lhs) = Self::cmp.context("lhs operand").parse(input)?;
+        let (input, lhs) = Self::cmp.context("and lhs operand").parse(input)?;
         let (input, rest) = fold_many0(
             tuple((
                 alt((tag("&").context("and"),))
@@ -377,8 +614,9 @@ impl Expression {
         Ok((input, lhs))
     }
 
+    #[tracable_parser]
     fn or(input: Span<'_>) -> ParseResult<'_, Self> {
-        let (input, lhs) = Self::and.context("lhs operand").parse(input)?;
+        let (input, lhs) = Self::and.context("or lhs operand").parse(input)?;
         let (input, rest) = fold_many0(
             tuple((
                 alt((tag("|").context("and"),))
@@ -404,22 +642,110 @@ impl Expression {
     }
 
     #[recursive_parser]
-    fn expr(s: Span) -> ParseResult<Self> {
-        Self::or(s)
+    #[tracable_parser]
+    fn let_expr(s: Span) -> ParseResult<Self> {
+        let (input, decls) = many0(Declaration::parse)
+            .preceded_by(tag("let").delimited_by(multispace0))
+            .parse(s)?;
+        let (input, exprs) = Self::exprs
+            .context("in block")
+            .preceded_by(tag("in").context("in keyword").delimited_by(multispace0))
+            .terminated(tag("end").context("end keyword").delimited_by(multispace0))
+            .parse(input)?;
+        Ok((
+            input,
+            Expression::Let {
+                decls,
+                exprs: Box::new(exprs),
+            },
+        ))
     }
 
     #[recursive_parser]
+    #[tracable_parser]
+    fn expr(s: Span) -> ParseResult<Self> {
+        let (s, ()) = not(tag("end"))(s)?;
+        alt((
+            Self::let_expr.context("let expression"),
+            Self::or.context("normal expression"),
+        ))
+        .parse(s)
+    }
+
+    #[recursive_parser]
+    #[tracable_parser]
     fn exprs(s: Span) -> ParseResult<Self> {
         map(
-            many1(Self::expr.terminated(opt(tag(";").delimited_by(multispace0)))),
+            many1(
+                Self::expr
+                    .context("exprs")
+                    .terminated(opt(tag(";").delimited_by(multispace0))),
+            ),
             |v| Self::Block(v),
         )(s)
     }
 }
 
+#[tracable_parser]
+pub(crate) fn any_keyword(input: Span) -> ParseResult<String> {
+    // Normal keywords
+    let parse = alt((
+        tag("array").context("array keyword"),
+        tag("if").context("if keyword"),
+        tag("then").context("then keyword"),
+        tag("else").context("else keyword"),
+        tag("while").context("while keyword"),
+        tag("for").context("for keyword"),
+        tag("to").context("to keyword"),
+        tag("do").context("do keyword"),
+        tag("let").context("let keyword"),
+        tag("in").context("in keyword"),
+        tag("end").context("end keyword"),
+        tag("of").context("of keyword"),
+        tag("break").context("break keyword"),
+        tag("nil").context("nil keyword"),
+        tag("function").context("function keyword"),
+        tag("var").context("var keyword"),
+        tag("type").context("type keyword"),
+        tag("import").context("import keyword"),
+        tag("primitive").context("primitive keyword"),
+    ))
+    // Object stuff
+    .or(alt((
+        tag("object").context("object keyword"),
+        tag("extends").context("extends keyword"),
+        tag("method").context("method keyword"),
+        tag("new").context("new keyword"),
+    )))
+    .delimited_by(multispace1)
+    .map(|keyword: Span| keyword.to_string())
+    .parse(input);
+    if input.fragment() == &"end" {
+        panic!("end found {:?}", parse);
+    }
+    parse
+}
+
+#[tracable_parser]
+pub(crate) fn id(input: Span) -> ParseResult<String> {
+    let (input, ()) = not(any_keyword).context("not keyword").parse(input)?;
+    let (input, id) = alt((
+        tag("_main").context("_main keyword"),
+        recognize(tuple((
+            alpha1::<Span, _>.context("head"),
+            take_while(|c| is_alphanumeric(c as u8) || c == '_'),
+        ))),
+    ))
+    .delimited_by(multispace0)
+    .map(|name| name.to_string())
+    .parse(input)?;
+    Ok((input, id))
+}
+
 #[cfg(test)]
 mod tests {
     use miette::GraphicalReportHandler;
+    use nom_tracable::{cumulative_histogram, histogram};
 
     use super::*;
 
@@ -448,7 +774,7 @@ mod tests {
     fn int_neg() {
         let input = "-10";
         let mut p = Program::new(input).unwrap();
-        let e = &p.expressions[0];
+        let e = &p.expression;
         assert_eq!(
             e,
             &Expression::UnaryOp(Op::Minus, Box::new(Expression::IntLit(10)))
@@ -466,7 +792,7 @@ mod tests {
 
     #[test]
     fn int_semi() {
-        let input = "10;";
+        let input = "(10;)";
         let e = Program::new(input).unwrap().run().unwrap();
         assert_eq!(e, Expression::IntLit(10));
     }
@@ -495,8 +821,8 @@ mod tests {
         let p = Program::new(&input).unwrap();
         assert_eq!(input, "");
         assert_eq!(
-            p.expressions,
-            vec![Expression::Call {
+            p.expression,
+            Expression::Call {
                 name: "print".to_string(),
                 parameters: vec![
                     Expression::StringLit("Hello, World!\\n".to_string()),
@@ -505,7 +831,7 @@ mod tests {
                     Expression::IntLit(2),
                     Expression::Nil
                 ]
-            }],
+            },
         );
     }
 
@@ -514,7 +840,7 @@ mod tests {
         let input = "5 * 4";
         let mut p = Program::new(input).unwrap();
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Times,
                 first: Box::new(Expression::IntLit(5)),
@@ -529,7 +855,7 @@ mod tests {
         let input = "6 * 3 / 2";
         let mut p = Program::new(input).unwrap();
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Divide,
                 first: Box::new(Expression::BinaryOp {
@@ -548,7 +874,7 @@ mod tests {
         let input = "6 * 3 - 2";
         let mut p = Program::new(input).unwrap();
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Minus,
                 first: Box::new(Expression::BinaryOp {
@@ -567,7 +893,7 @@ mod tests {
         let input = "2 - 6 * -3 ";
         let mut p = Program::new(input).unwrap();
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Minus,
                 first: Box::new(Expression::IntLit(2)),
@@ -590,7 +916,7 @@ mod tests {
         let mut p = Program::new(input).unwrap();
         assert_eq!(p.run().unwrap().as_int().unwrap(), 18);
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Times,
                 first: Box::new(Expression::IntLit(3)),
@@ -610,7 +936,7 @@ mod tests {
         let mut p = Program::new(input).unwrap();
         assert_eq!(p.run().unwrap().as_int().unwrap(), 0);
         assert_eq!(
-            p.expressions[0],
+            p.expression,
             Expression::BinaryOp {
                 op_type: Op::Gt,
                 first: Box::new(Expression::IntLit(3)),
@@ -634,5 +960,92 @@ mod tests {
             }
         };
         assert_eq!(p.run().unwrap().as_int().unwrap(), 1);
+    }
+
+    #[test]
+    fn lvalue() {
+        let input = "a + b";
+        let mut p = Program::new(input).pretty_unwrap();
+        assert_eq!(
+            p.expression,
+            Expression::BinaryOp {
+                op_type: Op::Plus,
+                first: Box::new(Expression::Id("a".into())),
+                second: Box::new(Expression::Id("b".into())),
+            }
+        );
+        assert!(matches!(p.run(), Err(InterpretterError::NameError(_))));
+    }
+
+    #[test]
+    fn assign() {
+        let input = "a := 5";
+        let mut p = Program::new(input).pretty_unwrap();
+        assert_eq!(
+            p.expression,
+            Expression::Assign("a".into(), Box::new(Expression::IntLit(5)),)
+        );
+        assert!(matches!(p.run(), Err(InterpretterError::NameError(_))));
+    }
+
+    #[test]
+    fn simple_declaration() {
+        let input = "var a: int := 0";
+        let d = Declaration::parse(Span::new_extra(input, ParserInfo::default())).finish();
+        histogram();
+        cumulative_histogram();
+        let d = d
+            .map_err(|e| FormattedError::from_nom(input, e))
+            .pretty_unwrap()
+            .1;
+        assert_eq!(
+            d,
+            Declaration::Variable {
+                id: "a".into(),
+                type_id: Some("int".into()),
+                expr: Expression::IntLit(0),
+            }
+        );
+    }
+
+    #[test]
+    fn let_assign() {
+        let input = "let
+                var a: int := 0
+            in
+                a := 5;
+                a
+            end";
+        let mut p = Program::new(input).pretty_unwrap();
+        assert_eq!(
+            p.expression,
+            Expression::Let {
+                decls: vec![Declaration::Variable {
+                    id: "a".into(),
+                    type_id: Some("int".into()),
+                    expr: Expression::IntLit(0),
+                }],
+                exprs: Box::new(Expression::Block(vec![
+                    Expression::Assign("a".into(), Box::new(Expression::IntLit(5)),),
+                    Expression::Id("a".into())
+                ])),
+            },
+        );
+        assert!(matches!(p.run(), Ok(Expression::IntLit(5))));
+    }
+
+    // TODO test nested lets
+
+    #[test]
+    fn var_type() {
+        let input = " : int ";
+        let ty = Declaration::var_type(Span::new_extra(input, ParserInfo::default()))
+            .finish()
+            .map_err(|e| FormattedError::from_nom(input, e))
+            .pretty_unwrap()
+            .1;
+        histogram();
+        cumulative_histogram();
+        assert_eq!(ty, Some("int".into()))
     }
 }

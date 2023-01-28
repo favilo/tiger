@@ -1,6 +1,7 @@
 use clap::Parser;
 use color_eyre::{eyre::bail, Result};
 use miette::GraphicalReportHandler;
+use nom_tracable::{cumulative_histogram, histogram};
 
 use std::{fs::File, io::prelude::*, path::PathBuf};
 
@@ -35,6 +36,8 @@ fn main() -> Result<()> {
             bail!("{s}");
         }
     };
+    histogram();
+    cumulative_histogram();
     log::info!("{:?}", p.run());
     Ok(())
 }

@@ -12,8 +12,13 @@ color-eyre = "0.6.2"
 log = "0.4.17"
 miette = { version = "5.5.0", features = ["fancy"] }
 nom = "7.1.3"
-nom-recursive = "0.4.0"
+nom-recursive = { version = "0.4.0", features = [] }
 nom-supreme = "0.8.0"
+nom-tracable = { version = "0.8.0", features = [] }
 nom_locate = "4.1.0"
 simple_logger = "4.0.0"
 thiserror = "1.0.38"
+
+[features]
+default = []
+trace = ["nom-tracable/trace"]
